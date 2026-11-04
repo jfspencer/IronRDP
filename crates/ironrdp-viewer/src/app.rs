@@ -379,7 +379,7 @@ impl RpcApp {
     }
 
     fn update_frame(&mut self, buffer: Vec<u32>, width: NonZeroU32, height: NonZeroU32) {
-        let Some((window, surface)) = self.window.as_mut() else {
+        let Some((window, _)) = self.window.as_ref() else {
             return;
         };
         trace!(?width, ?height, "Received RPC-backed image");
@@ -388,19 +388,32 @@ impl RpcApp {
             u16::try_from(height.get()).expect("frame height fits in u16"),
         );
         self.buffer = buffer;
-        surface.resize(width, height).expect("surface resize");
         window.request_redraw();
     }
 
+    /// Draws the session frame scaled to fit the window, keeping its aspect ratio and filling the
+    /// uncovered bands with black.
     fn draw(&mut self) {
         if self.buffer.is_empty() {
             return;
         }
-        let Some((_, surface)) = self.window.as_mut() else {
+        let Some((window, surface)) = self.window.as_mut() else {
             return;
         };
+        let window_size = window.inner_size();
+        let (Some(window_width), Some(window_height)) =
+            (NonZeroU32::new(window_size.width), NonZeroU32::new(window_size.height))
+        else {
+            return;
+        };
+        surface.resize(window_width, window_height).expect("surface resize");
         let mut sb_buffer = surface.buffer_mut().expect("surface buffer");
-        sb_buffer.copy_from_slice(self.buffer.as_slice());
+        scale_frame_to_fit(
+            &mut sb_buffer,
+            (window_width.get(), window_height.get()),
+            &self.buffer,
+            self.buffer_size,
+        );
         sb_buffer.present().expect("buffer present");
     }
     fn on_about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -470,6 +483,7 @@ impl RpcApp {
             WindowEvent::Resized(size) => {
                 self.last_size = Some(size);
                 self.resize_timeout = Some(Instant::now() + Duration::from_secs(1));
+                window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { .. } => {
                 // The window moved to a monitor with another DPI, or the monitor DPI changed.
@@ -682,11 +696,8 @@ impl RpcApp {
                 trace!(width = ?width, height = ?height, "Received image with size");
                 self.buffer_size = (width.get(), height.get());
                 self.buffer = buffer;
-                if let Some((window, surface)) = self.window.as_mut() {
+                if let Some((window, _)) = self.window.as_mut() {
                     trace!(window_physical_size = ?window.inner_size(), "Drawing image to the window with size");
-                    surface
-                        .resize(NonZeroU32::from(width), NonZeroU32::from(height))
-                        .expect("surface resize");
                     window.request_redraw();
                 }
                 self.rail_windows.request_redraw_all();
@@ -930,21 +941,114 @@ impl ApplicationHandler<RdpOutputEvent> for App {
     }
 }
 
-/// Maps a window position onto the remote desktop, which the viewer stretches over the client area.
+/// The window-pixel rectangle the session frame occupies once scaled to fit the window with its
+/// aspect ratio kept.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FittedFrame {
+    left: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+}
+
+fn fitted_frame(window_size: (u32, u32), desktop_size: (u16, u16)) -> FittedFrame {
+    let window_width = f64::from(window_size.0.max(1));
+    let window_height = f64::from(window_size.1.max(1));
+    let desktop_width = f64::from(desktop_size.0.max(1));
+    let desktop_height = f64::from(desktop_size.1.max(1));
+    let scale = (window_width / desktop_width).min(window_height / desktop_height);
+    let width = desktop_width * scale;
+    let height = desktop_height * scale;
+    FittedFrame {
+        left: (window_width - width) / 2.0,
+        top: (window_height - height) / 2.0,
+        width,
+        height,
+    }
+}
+
+/// Maps a window position onto the remote desktop, which the viewer scales to fit the client
+/// area with its aspect ratio kept; a position in the black bands clamps to the nearest edge.
 fn desktop_position(
     window_size: PhysicalSize<u32>,
     desktop_size: (u16, u16),
     position: PhysicalPosition<f64>,
 ) -> ironrdp::input::MousePosition {
-    let scale = |position: f64, window: u32, desktop: u16| {
-        let scaled = position / f64::from(window.max(1)) * f64::from(desktop);
+    let frame = fitted_frame((window_size.width, window_size.height), desktop_size);
+    let scale = |position: f64, origin: f64, extent: f64, desktop: u16| {
+        let scaled = (position - origin) / extent.max(1.0) * f64::from(desktop);
         #[expect(clippy::as_conversions, reason = "casting a clamped f64 to u16")]
         let scaled = scaled.clamp(0.0, f64::from(desktop.saturating_sub(1))) as u16;
         scaled
     };
     ironrdp::input::MousePosition {
-        x: scale(position.x, window_size.width, desktop_size.0),
-        y: scale(position.y, window_size.height, desktop_size.1),
+        x: scale(position.x, frame.left, frame.width, desktop_size.0),
+        y: scale(position.y, frame.top, frame.height, desktop_size.1),
+    }
+}
+
+/// Bilinearly resamples a `0RGB` session frame into a window-sized `0RGB` buffer, centred and
+/// scaled to fit with its aspect ratio kept, painting the uncovered bands black.
+fn scale_frame_to_fit(destination: &mut [u32], window_size: (u32, u32), source: &[u32], source_size: (u16, u16)) {
+    #[expect(clippy::as_conversions, reason = "pixel indices fit in usize")]
+    let (window_width, window_height) = (window_size.0 as usize, window_size.1 as usize);
+    let (source_width, source_height) = (usize::from(source_size.0), usize::from(source_size.1));
+    destination.fill(0);
+    if window_width == 0 || window_height == 0 || source_width == 0 || source_height == 0 {
+        return;
+    }
+    if source.len() < source_width * source_height || destination.len() < window_width * window_height {
+        return;
+    }
+
+    let frame = fitted_frame(window_size, source_size);
+    #[expect(
+        clippy::as_conversions,
+        reason = "casting clamped, non-negative f64 pixel bounds to usize"
+    )]
+    let to_pixel = |value: f64, limit: usize| (value.round().max(0.0) as usize).min(limit);
+    let left = to_pixel(frame.left, window_width);
+    let top = to_pixel(frame.top, window_height);
+    let right = to_pixel(frame.left + frame.width, window_width);
+    let bottom = to_pixel(frame.top + frame.height, window_height);
+    if right <= left || bottom <= top {
+        return;
+    }
+
+    #[expect(clippy::as_conversions, reason = "pixel counts fit in f64")]
+    let source_per_window_x = source_width as f64 / (right - left) as f64;
+    #[expect(clippy::as_conversions, reason = "pixel counts fit in f64")]
+    let source_per_window_y = source_height as f64 / (bottom - top) as f64;
+
+    #[expect(clippy::as_conversions, reason = "pixel indices fit in f64 and back")]
+    let sample_axis = |window_offset: usize, source_per_window: f64, source_extent: usize| {
+        let position = ((window_offset as f64 + 0.5) * source_per_window - 0.5).max(0.0);
+        let low = (position.floor() as usize).min(source_extent - 1);
+        let high = (low + 1).min(source_extent - 1);
+        let weight = ((position - low as f64).clamp(0.0, 1.0) * 256.0) as u32;
+        (low, high, weight)
+    };
+    let columns: Vec<(usize, usize, u32)> = (0..right - left)
+        .map(|offset| sample_axis(offset, source_per_window_x, source_width))
+        .collect();
+
+    let blend = |a: u32, b: u32, weight: u32| {
+        let inverse = 256 - weight;
+        let red_blue = ((a & 0x00FF_00FF) * inverse + (b & 0x00FF_00FF) * weight) >> 8;
+        let green = ((a & 0x0000_FF00) * inverse + (b & 0x0000_FF00) * weight) >> 8;
+        (red_blue & 0x00FF_00FF) | (green & 0x0000_FF00)
+    };
+
+    for window_y in top..bottom {
+        let (row_low, row_high, row_weight) = sample_axis(window_y - top, source_per_window_y, source_height);
+        let upper_row = &source[row_low * source_width..(row_low + 1) * source_width];
+        let lower_row = &source[row_high * source_width..(row_high + 1) * source_width];
+        let destination_row = &mut destination[window_y * window_width + left..window_y * window_width + right];
+        for (pixel, &(column_low, column_high, column_weight)) in destination_row.iter_mut().zip(&columns) {
+            let upper = blend(upper_row[column_low], upper_row[column_high], column_weight);
+            let lower = blend(lower_row[column_low], lower_row[column_high], column_weight);
+            *pixel = blend(upper, lower, row_weight);
+        }
     }
 }
 
@@ -1167,4 +1271,61 @@ fn mouse_button_operation(state: event::ElementState, button: event::MouseButton
         event::ElementState::Pressed => ironrdp::input::Operation::MouseButtonPressed(mouse_button),
         event::ElementState::Released => ironrdp::input::Operation::MouseButtonReleased(mouse_button),
     })
+}
+
+#[cfg(test)]
+mod scale_to_fit_tests {
+    use super::*;
+
+    #[test]
+    fn a_wider_desktop_is_letterboxed_top_and_bottom() {
+        let frame = fitted_frame((1000, 1000), (2000, 1000));
+        assert_eq!(
+            frame,
+            FittedFrame {
+                left: 0.0,
+                top: 250.0,
+                width: 1000.0,
+                height: 500.0
+            }
+        );
+    }
+
+    #[test]
+    fn a_click_maps_through_the_fitted_frame() {
+        let position = desktop_position(
+            PhysicalSize::new(1000, 1000),
+            (2000, 1000),
+            PhysicalPosition::new(500.0, 500.0),
+        );
+        assert_eq!((position.x, position.y), (1000, 500));
+    }
+
+    #[test]
+    fn a_click_in_the_black_band_clamps_to_the_desktop_edge() {
+        let position = desktop_position(
+            PhysicalSize::new(1000, 1000),
+            (2000, 1000),
+            PhysicalPosition::new(0.0, 10.0),
+        );
+        assert_eq!((position.x, position.y), (0, 0));
+    }
+
+    #[test]
+    fn a_uniform_frame_scales_to_the_same_colour_inside_black_bands() {
+        let source = vec![0x0012_3456; 4 * 2];
+        let mut destination = vec![0xFFFF_FFFF; 4 * 4];
+        scale_frame_to_fit(&mut destination, (4, 4), &source, (4, 2));
+        assert_eq!(&destination[0..4], &[0; 4]);
+        assert_eq!(&destination[4..12], &[0x0012_3456; 8]);
+        assert_eq!(&destination[12..16], &[0; 4]);
+    }
+
+    #[test]
+    fn a_frame_at_window_size_copies_through_unchanged() {
+        let source: Vec<u32> = (0..12).map(|value| value * 0x0001_0101).collect();
+        let mut destination = vec![0; 12];
+        scale_frame_to_fit(&mut destination, (4, 3), &source, (4, 3));
+        assert_eq!(destination, source);
+    }
 }
